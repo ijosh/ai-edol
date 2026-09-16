@@ -43,7 +43,7 @@ from utils.universal_tokeniser_naive import load_tokenisers
 from utils.json_logger import setup_json_logging
 from utils.device_utils import get_device_from_config
 
-VALID_STAGES = ['dummy_data', 'tokeniser', 'sharding', 'training', 'inference', 'evaluation']
+VALID_STAGES = ['dummy_data', 'tokeniser', 'sharding', 'training', 'inference', 'evaluation', 'generate_embedded_model']
 
 
 def log(message, stage='PIPELINE'):
@@ -171,7 +171,7 @@ def _create_model(training_config, vocab_sizes, output_variable):
     """Create a single-output GPT model for electricity or gas."""
     model_config = training_config['model'][output_variable]
     context_length = training_config['model']['context_length']
-    return GPTSmartMeterModel(
+    model = GPTSmartMeterModel(
         vocab_sizes=vocab_sizes,
         d_model=model_config['n_embd'],
         nhead=model_config['n_head'],
@@ -181,6 +181,10 @@ def _create_model(training_config, vocab_sizes, output_variable):
         dropout=model_config['dropout'],
         output_variable=output_variable,
     )
+    print("==============================================")
+    model.print_model_info()
+    print("==============================================")
+    return model
 
 
 def _train_one(output_variable, training_config, run_path, vocab_sizes, bin_means,
@@ -442,6 +446,162 @@ def stage_evaluation(config, run_path):
         f"{results.n_households} households", 'EVALUATION')
     return True
 
+def stage_generate_embedded_model(config, run_path):
+    """
+    Export the compute-intensive portions of the trained electricity
+    and gas GPT models to ONNX for accelerator deployment.
+    """
+
+    stage_config = config.get('generate_embedded_model', {}).copy()
+
+    # -------------------------------------------------------
+    # Configuration
+    # -------------------------------------------------------
+
+    model_dir = resolve(
+        run_path,
+        stage_config.get(
+            'path_to_trained_models',
+            'models'
+        )
+    )
+
+    output_dir = resolve(
+        run_path,
+        stage_config.get(
+            'output_dir',
+            'embedded_models'
+        )
+    )
+
+    model_type = stage_config.get(
+        'best_model_to_use',
+        'val'
+    )
+
+    os.makedirs(
+        output_dir,
+        exist_ok=True
+    )
+
+    log(
+        f"Loading trained models from: {model_dir}",
+        'EMBEDDED_MODEL'
+    )
+
+    # -------------------------------------------------------
+    # Locate trained PyTorch models
+    # -------------------------------------------------------
+
+    electricity_path = os.path.join(
+        model_dir,
+        f'electricity_best_{model_type}_model.pth'
+    )
+
+    gas_path = os.path.join(
+        model_dir,
+        f'gas_best_{model_type}_model.pth'
+    )
+
+    if not os.path.exists(electricity_path):
+        log(
+            f"Electricity model not found: {electricity_path}",
+            'EMBEDDED_MODEL'
+        )
+        return False
+
+    if not os.path.exists(gas_path):
+        log(
+            f"Gas model not found: {gas_path}",
+            'EMBEDDED_MODEL'
+        )
+        return False
+
+    # -------------------------------------------------------
+    # Load on CPU`
+    #
+    # There is no reason to involve CUDA here. We're just
+    # validating and exporting ONNX.
+    # -------------------------------------------------------
+
+    electricity_model = torch.load(
+        electricity_path,
+        map_location='cpu',
+        weights_only=False
+    )
+
+    gas_model = torch.load(
+        gas_path,
+        map_location='cpu',
+        weights_only=False
+    )
+
+    electricity_model.eval()
+    gas_model.eval()
+
+    # -------------------------------------------------------
+    # Output paths
+    # -------------------------------------------------------
+
+    electricity_onnx = os.path.join(
+        output_dir,
+        'electricity_compute.onnx'
+    )
+
+    gas_onnx = os.path.join(
+        output_dir,
+        'gas_compute.onnx'
+    )
+
+    # -------------------------------------------------------
+    # Electricity
+    # -------------------------------------------------------
+
+    log(
+        "Exporting electricity compute model...",
+        'EMBEDDED_MODEL'
+    )
+
+    electricity_model.create_embeddable_model(
+        electricity_onnx
+    )
+
+    log(
+        f"Electricity ONNX: {electricity_onnx}",
+        'EMBEDDED_MODEL'
+    )
+
+    # -------------------------------------------------------
+    # Gas
+    # -------------------------------------------------------
+
+    log(
+        "Exporting gas compute model...",
+        'EMBEDDED_MODEL'
+    )
+
+    gas_model.create_embeddable_model(
+        gas_onnx
+    )
+
+    log(
+        f"Gas ONNX: {gas_onnx}",
+        'EMBEDDED_MODEL'
+    )
+
+    # -------------------------------------------------------
+    # Done
+    # -------------------------------------------------------
+
+    log(
+        "Embedded model export completed successfully",
+        'EMBEDDED_MODEL'
+    )
+
+    return True
+
+
+
 
 STAGE_FUNCS = {
     'dummy_data': stage_dummy_data,
@@ -450,6 +610,7 @@ STAGE_FUNCS = {
     'training': stage_training,
     'inference': stage_inference,
     'evaluation': stage_evaluation,
+    'generate_embedded_model': stage_generate_embedded_model,
 }
 
 

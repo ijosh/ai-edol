@@ -7,6 +7,43 @@ import torch.nn.functional as F
 from typing import List
 import logging
 
+class EmbeddableComputeModel(nn.Module):
+    def __init__(self, trained_model, seq_len=336):
+        super().__init__()
+        self.transformer_layers = (
+            trained_model.transformer_decoder_layers
+        )
+
+        # Take the TRAINED output head
+        self.output_layer = trained_model.output_layer
+
+         # Fixed causal mask for deployment
+        mask = torch.tril(
+            torch.ones(seq_len, seq_len)
+        )
+
+        mask = mask.masked_fill(
+            mask == 0,
+            float("-inf")
+        )
+
+        self.register_buffer(
+            "causal_mask",
+            mask
+        )
+
+    def forward(self, x):
+        for layer in self.transformer_layers:
+            x = layer(x, tgt_mask=self.causal_mask)
+        
+        # Only take the final timestep
+        x = x[:, -1, :]
+
+        # [B,32] -> [B,66]
+        x = self.output_layer(x)
+
+        return x #[B, 66]
+
 
 class CustomTransformerDecoderLayer(nn.Module):
     """Custom Transformer Decoder Layer with prenorm architecture."""
@@ -23,6 +60,7 @@ class CustomTransformerDecoderLayer(nn.Module):
         """
         super(CustomTransformerDecoderLayer, self).__init__()
         
+        print(f"Model Dimension {d_model}\nnhead {nhead}\ndim_feedforward {dim_feedforward}\ndropout {dropout}")
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
@@ -150,6 +188,7 @@ class GPTSmartMeterModel(nn.Module):
         )
         
         # Custom Transformer Decoder layers
+        print(f"NUM LAYERS IS {num_layers}")
         self.transformer_decoder_layers = nn.ModuleList([
             CustomTransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout) 
             for _ in range(num_layers)
@@ -161,24 +200,8 @@ class GPTSmartMeterModel(nn.Module):
             self.output_layer = nn.Linear(d_model, vocab_sizes[1])
         else:
             raise ValueError(f"Unsupported output variable: {output_variable}")
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the model.
 
-        Args:
-            x: Input tensor of shape [batch_size, seq_len, num_input_features]
-               where num_input_features = 11 (elec, gas, temp, solar, hh, dow, month, + 4 conditioning)
-
-        Returns:
-            Output logits of shape [batch_size, seq_len, vocab_size]
-            where vocab_size is either vocab_sizes[0] (electricity) or vocab_sizes[1] (gas)
-            depending on output_variable configuration.
-
-        Note:
-            This method only performs forward pass. Autoregressive generation is handled
-            by DualModelGenerator which coordinates both electricity and gas models.
-        """
+    def prepare_embeddings(self, x: torch.Tensor) -> torch.Tensor:
         # Embed each feature separately and sum them
         embeddings = []
         for i, emb_layer in enumerate(self.embeddings):
@@ -196,7 +219,16 @@ class GPTSmartMeterModel(nn.Module):
         positions = torch.arange(0, seq_len, device=x.device).unsqueeze(0).expand(x.size(0), -1)
         pos_encoding = self.pos_embedding(positions)
         x = x + pos_encoding
-        
+
+        return x # [B, T, d_model]
+
+    def process_compute_hailo(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("Running via Hailo backend is not yet implemented")
+        return 
+    
+    def process_compute_pytorch(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.size(1)
+
         # Generate causal mask
         subsequent_mask = self.tril_mask[:seq_len, :seq_len]
         subsequent_mask = subsequent_mask.masked_fill(subsequent_mask == 0, float('-inf'))
@@ -207,6 +239,85 @@ class GPTSmartMeterModel(nn.Module):
             
         # Project to output vocabularies (electricity or gas depending on config)
         output = self.output_layer(x)          
-        
         return output
+
+
+    def process_compute(self, x: torch.Tensor, backend = "cpu") -> torch.Tensor:
+
+        # Always train on cpu. Optionally run inference on the hailo card
+        if backend == "cpu" or self.training:
+            return self.process_compute_pytorch(self, x)        
+        elif backend == "hailo":
+            return self.process_compute_hailo(self, x)
+        else:
+            raise ValueError(f"Unsupported Backend: {backend}")
+        
+    def forward(self, x: torch.Tensor, backend = "cpu") -> torch.Tensor:
+        """
+        Forward pass through the model.
+
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, num_input_features]
+               where num_input_features = 11 (elec, gas, temp, solar, hh, dow, month, + 4 conditioning)
+
+        Returns:
+            Output logits of shape [batch_size, seq_len, vocab_size]
+            where vocab_size is either vocab_sizes[0] (electricity) or vocab_sizes[1] (gas)
+            depending on output_variable configuration.
+
+        Note:
+            This method only performs forward pass. Autoregressive generation is handled
+            by DualModelGenerator which coordinates both electricity and gas models.
+        """
+
+        embeddings = self.prepare_embeddings(x)
+        output = self.process_compute(embeddings, backend=backend)
+
+        return output
+
+    def print_model_info(self):
+        print(self)
     
+    
+    def create_embeddable_model(self, output_onnx = "./embeddable_model.onnx"):
+        """
+        Run this once the model is trained to extract all the transformer layers and put them in an onnx file
+        """
+
+        self.eval(); # Put model in evaluation mode to disable dropout etc
+
+        embeddable_model = EmbeddableComputeModel(self)
+        embeddable_model.eval()
+        
+        dummy_input = torch.randn(
+            1,
+            self.context_length,
+            self.d_model
+        )
+
+        # Test it matches 
+        with torch.no_grad():
+            output_ebd = embeddable_model.forward(dummy_input)
+            output_cpu = self.process_compute_pytorch(dummy_input)
+
+            # Compare cpu model with last output of cpu model
+            torch.testing.assert_close(
+                output_ebd,
+                output_cpu[:, -1, :]
+            ) 
+
+        # Export model
+        torch.onnx.export(
+            embeddable_model,
+            dummy_input,
+            output_onnx,
+            input_names=["embedded_input"],
+            output_names=["logits"],
+            opset_version=17,
+            do_constant_folding=True
+        )
+
+        print(f"Exported ONNX model to: {output_onnx}")
+
+        return embeddable_model
+

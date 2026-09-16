@@ -9,12 +9,13 @@ experiment:
   description: "End-to-end demo pipeline on generated dummy data"
   output_dir: "output"          # all stage outputs are written here
   stages:
-    - dummy_data                # generate SERL-like dummy data
-    - tokeniser                 # build tokenisers and tokenise data
-    - sharding                  # create train/val/test shards
+#    - dummy_data                # generate SERL-like dummy data
+#    - tokeniser                 # build tokenisers and tokenise data
+#    - sharding                  # create train/val/test shards
     - training                  # train electricity and gas GPT models
     - inference                 # generate synthetic data
     - evaluation                # evaluate fidelity of synthetic data
+    - generate_embedded_model   # Take the trained model and generate embedded model
 
 # ---------------------------------------------------------------------------
 # DUMMY DATA
@@ -248,3 +249,17 @@ evaluation:
   shard_metadata_path: "data/shards/shard_metadata.json"
   metadata_catalog_path: null
   tokeniser_file: "tokenisers/tokenisers.pkl"
+
+
+# ---------------------------------------------------------------------------
+# EVALUATION
+# ---------------------------------------------------------------------------
+generate_embedded_model:
+  path_to_trained_models: .
+  output_dir: embedded_models
+
+  # Corresponds to:
+  #
+  # electricity_best_val_model.pth
+  # gas_best_val_model.pth
+  best_model_to_use: val
