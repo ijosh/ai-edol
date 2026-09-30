@@ -42,6 +42,8 @@ from evaluation.mapreduce import ParallelEvaluator, visualize_results
 from utils.universal_tokeniser_naive import load_tokenisers
 from utils.json_logger import setup_json_logging
 from utils.device_utils import get_device_from_config
+from utils.generate_hailo_calibration_data import make_hailo_calibration_dataset
+from utils.export_tokenizer import export_tokenizer
 
 VALID_STAGES = ['dummy_data', 'tokeniser', 'sharding', 'training', 'inference', 'evaluation', 'generate_embedded_model']
 
@@ -450,13 +452,11 @@ def stage_generate_embedded_model(config, run_path):
     """
     Export the compute-intensive portions of the trained electricity
     and gas GPT models to ONNX for accelerator deployment.
+
+    Also export tokensiser and embedding data for the C port 
     """
 
     stage_config = config.get('generate_embedded_model', {}).copy()
-
-    # -------------------------------------------------------
-    # Configuration
-    # -------------------------------------------------------
 
     model_dir = resolve(
         run_path,
@@ -489,10 +489,6 @@ def stage_generate_embedded_model(config, run_path):
         'EMBEDDED_MODEL'
     )
 
-    # -------------------------------------------------------
-    # Locate trained PyTorch models
-    # -------------------------------------------------------
-
     electricity_path = os.path.join(
         model_dir,
         f'electricity_best_{model_type}_model.pth'
@@ -517,13 +513,6 @@ def stage_generate_embedded_model(config, run_path):
         )
         return False
 
-    # -------------------------------------------------------
-    # Load on CPU`
-    #
-    # There is no reason to involve CUDA here. We're just
-    # validating and exporting ONNX.
-    # -------------------------------------------------------
-
     electricity_model = torch.load(
         electricity_path,
         map_location='cpu',
@@ -539,23 +528,18 @@ def stage_generate_embedded_model(config, run_path):
     electricity_model.eval()
     gas_model.eval()
 
-    # -------------------------------------------------------
-    # Output paths
-    # -------------------------------------------------------
-
+    # --- Output paths --- 
     electricity_onnx = os.path.join(
         output_dir,
-        'electricity_compute.onnx'
+        'electricity'
     )
 
     gas_onnx = os.path.join(
         output_dir,
-        'gas_compute.onnx'
+        'gas'
     )
 
-    # -------------------------------------------------------
-    # Electricity
-    # -------------------------------------------------------
+    # --- Electricity --- 
 
     log(
         "Exporting electricity compute model...",
@@ -571,9 +555,7 @@ def stage_generate_embedded_model(config, run_path):
         'EMBEDDED_MODEL'
     )
 
-    # -------------------------------------------------------
-    # Gas
-    # -------------------------------------------------------
+    # --- Gas ---
 
     log(
         "Exporting gas compute model...",
@@ -589,10 +571,99 @@ def stage_generate_embedded_model(config, run_path):
         'EMBEDDED_MODEL'
     )
 
-    # -------------------------------------------------------
-    # Done
-    # -------------------------------------------------------
+    # --- Calibration datasets ---
 
+    shards_dir = config['training']['data']['path_to_shard_data']
+
+    electricity_calibration = os.path.join(
+        output_dir,
+        'electricity_calibration.npy'
+    )
+
+    gas_calibration = os.path.join(
+        output_dir,
+        'gas_calibration.npy'
+    )
+
+    log(
+        "Generating electricity calibration dataset...",
+        'EMBEDDED_MODEL'
+    )
+
+    make_hailo_calibration_dataset(
+        model=electricity_model,
+        shards_dir=shards_dir,
+        output_path=electricity_calibration,
+        num_samples=1024,
+        batch_size=32,
+        device='cpu',
+    )
+
+    log(
+        f"Electricity calibration dataset: {electricity_calibration}",
+        'EMBEDDED_MODEL'
+    )
+
+    log(
+        "Generating gas calibration dataset...",
+        'EMBEDDED_MODEL'
+    )
+
+    make_hailo_calibration_dataset(
+        model=gas_model,
+        shards_dir=shards_dir,
+        output_path=gas_calibration,
+        num_samples=1024,
+        batch_size=32,
+        device='cpu',
+    )
+
+    log(
+        f"Gas calibration dataset: {gas_calibration}",
+        'EMBEDDED_MODEL'
+    )
+    
+    # --- Export tokenizer / frontend configuration ---
+
+    tokenizer_output = os.path.join(
+        output_dir,
+        'tokenizer'
+    )
+
+    tokeniser_file = config['training']['data']['tokeniser_file']
+
+    log(
+        f"Loading tokenizer: {tokeniser_file}",
+        'EMBEDDED_MODEL'
+    )
+
+    (
+        elec_boundaries,
+        gas_boundaries,
+        temp_boundaries,
+        solar_boundaries,
+        elec_bin_means,
+        gas_bin_means,
+        value_transform,
+    ) = load_tokenisers(tokeniser_file)
+
+    export_tokenizer(
+        output_dir=tokenizer_output,
+        elec_boundaries=elec_boundaries,
+        gas_boundaries=gas_boundaries,
+        temp_boundaries=temp_boundaries,
+        solar_boundaries=solar_boundaries,
+        elec_bin_means=elec_bin_means,
+        gas_bin_means=gas_bin_means,
+        value_transform=value_transform,
+    )
+
+    log(
+        f"Tokenizer exported: {tokenizer_output}",
+        'EMBEDDED_MODEL'
+    )
+
+    # --- Done ---
     log(
         "Embedded model export completed successfully",
         'EMBEDDED_MODEL'

@@ -6,38 +6,105 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List
 import logging
+import numpy as np
+from pathlib import Path
+
+class EmbeddingModel(nn.Module):
+    """
+    This is an isolated version of the "frontend" of the model. IE just the code to go from input -> tokens -> embeddings
+    """
+    def __init__(self, 
+        vocab_sizes: List[int],
+        d_model: int,
+        context_length: int
+    ):
+        super().__init__()
+        
+        self.num_input_features = len(vocab_sizes)
+        self.d_model = d_model
+        self.context_length = context_length
+        
+        # Embedding layers for each input feature
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(vocab_size, d_model) for vocab_size in vocab_sizes
+        ])
+        
+        # Learnable positional embedding
+        self.pos_embedding = nn.Embedding(context_length, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Embed each feature separately and sum them
+        embeddings = []
+        for i, emb_layer in enumerate(self.embeddings):
+            
+            # Dont attempt to include runtime validation in the onnx export
+            if not torch.onnx.is_in_onnx_export():
+                max_index = x[:, :, i].max().item()
+                vocab_size = emb_layer.num_embeddings
+                if max_index >= vocab_size:
+                    logging.debug(f'Feature {i} has index out of range. Max: {max_index}, vocab: {vocab_size}')
+                    raise ValueError(f'Input feature {i} has index ({max_index}) exceeding vocab size ({vocab_size})')
+            
+            embeddings.append(emb_layer(x[:, :, i].long()))
+        
+        x = sum(embeddings)  # [batch_size, context_length, d_model]
+        
+        # Add learnable positional embedding
+        seq_len = x.size(1)
+        positions = torch.arange(0, seq_len, device=x.device).unsqueeze(0).expand(x.size(0), -1)
+        pos_encoding = self.pos_embedding(positions)
+        x = x + pos_encoding
+
+        return x # [B, T, d_model]
 
 class EmbeddableComputeModel(nn.Module):
+    """
+    This is an isolated version of the computationally heavy part of the model.
+    It is separated so that it can be exported to onnx and deployed on the hailo10h efficiently. 
+    """
     def __init__(self, trained_model, seq_len=336):
         super().__init__()
+
+        self.seq_len = trained_model.context_length
+        self.d_model = trained_model.d_model
+
         self.transformer_layers = (
             trained_model.transformer_decoder_layers
         )
 
-        # Take the TRAINED output head
         self.output_layer = trained_model.output_layer
 
-         # Fixed causal mask for deployment
-        mask = torch.tril(
-            torch.ones(seq_len, seq_len)
+        causal_mask = torch.zeros(
+            self.seq_len,
+            self.seq_len,
+            dtype=torch.float32
         )
 
-        mask = mask.masked_fill(
-            mask == 0,
+        causal_mask = causal_mask.masked_fill(
+            torch.triu(
+                torch.ones(
+                    self.seq_len,
+                    self.seq_len,
+                    dtype=torch.bool
+                ),
+                diagonal=1
+            ),
             float("-inf")
         )
 
         self.register_buffer(
             "causal_mask",
-            mask
+            causal_mask,
+            persistent=False
         )
+
 
     def forward(self, x):
         for layer in self.transformer_layers:
             x = layer(x, tgt_mask=self.causal_mask)
         
         # Only take the final timestep
-        x = x[:, -1, :]
+        #x = x[:, self.seq_len - 1, :]
 
         # [B,32] -> [B,66]
         x = self.output_layer(x)
@@ -172,14 +239,12 @@ class GPTSmartMeterModel(nn.Module):
         self.num_input_features = len(vocab_sizes)
         self.d_model = d_model
         self.context_length = context_length
-        
-        # Embedding layers for each input feature
-        self.embeddings = nn.ModuleList([
-            nn.Embedding(vocab_size, d_model) for vocab_size in vocab_sizes
-        ])
-        
-        # Learnable positional embedding
-        self.pos_embedding = nn.Embedding(context_length, d_model)
+
+        self.embedding_model = EmbeddingModel(
+            vocab_sizes=vocab_sizes,
+            d_model=d_model,
+            context_length=context_length,
+        )
         
         # Register lower triangular mask as buffer for efficiency
         self.register_buffer(
@@ -201,26 +266,6 @@ class GPTSmartMeterModel(nn.Module):
         else:
             raise ValueError(f"Unsupported output variable: {output_variable}")
 
-    def prepare_embeddings(self, x: torch.Tensor) -> torch.Tensor:
-        # Embed each feature separately and sum them
-        embeddings = []
-        for i, emb_layer in enumerate(self.embeddings):
-            max_index = x[:, :, i].max().item()
-            vocab_size = emb_layer.num_embeddings
-            if max_index >= vocab_size:
-                logging.debug(f'Feature {i} has index out of range. Max: {max_index}, vocab: {vocab_size}')
-                raise ValueError(f'Input feature {i} has index ({max_index}) exceeding vocab size ({vocab_size})')
-            embeddings.append(emb_layer(x[:, :, i].long()))
-        
-        x = sum(embeddings)  # [batch_size, context_length, d_model]
-        
-        # Add learnable positional embedding
-        seq_len = x.size(1)
-        positions = torch.arange(0, seq_len, device=x.device).unsqueeze(0).expand(x.size(0), -1)
-        pos_encoding = self.pos_embedding(positions)
-        x = x + pos_encoding
-
-        return x # [B, T, d_model]
 
     def process_compute_hailo(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("Running via Hailo backend is not yet implemented")
@@ -242,17 +287,17 @@ class GPTSmartMeterModel(nn.Module):
         return output
 
 
-    def process_compute(self, x: torch.Tensor, backend = "cpu") -> torch.Tensor:
+    def process_compute(self, x: torch.Tensor, backend: str = "cpu") -> torch.Tensor:
 
         # Always train on cpu. Optionally run inference on the hailo card
         if backend == "cpu" or self.training:
-            return self.process_compute_pytorch(self, x)        
+            return self.process_compute_pytorch(x)        
         elif backend == "hailo":
-            return self.process_compute_hailo(self, x)
+            return self.process_compute_hailo(x)
         else:
             raise ValueError(f"Unsupported Backend: {backend}")
         
-    def forward(self, x: torch.Tensor, backend = "cpu") -> torch.Tensor:
+    def forward(self, x: torch.Tensor, backend = "cpu", log: bool = True) -> torch.Tensor:
         """
         Forward pass through the model.
 
@@ -270,8 +315,19 @@ class GPTSmartMeterModel(nn.Module):
             by DualModelGenerator which coordinates both electricity and gas models.
         """
 
-        embeddings = self.prepare_embeddings(x)
+        embeddings = self.embedding_model(x)
         output = self.process_compute(embeddings, backend=backend)
+
+        if log:
+            assert backend == "cpu", "Logging with backend != cpu"
+
+            # Log inputs as integer (token ids)
+            x.detach().cpu().numpy().astype("<i4").tofile("input.bin")
+
+            # Log embeddings and outputs as f32
+            embeddings.detach().cpu().numpy().astype("<f4").tofile("embeddings.bin")
+            output.detach().cpu().numpy().astype("<f4").tofile("output.bin")
+
 
         return output
 
@@ -279,45 +335,73 @@ class GPTSmartMeterModel(nn.Module):
         print(self)
     
     
-    def create_embeddable_model(self, output_onnx = "./embeddable_model.onnx"):
+    def create_embeddable_model(self, output_dir):
         """
         Run this once the model is trained to extract all the transformer layers and put them in an onnx file
         """
 
-        self.eval(); # Put model in evaluation mode to disable dropout etc
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        embeddable_model = EmbeddableComputeModel(self)
-        embeddable_model.eval()
+        self.eval(); # Put model in evaluation mode to disable dropout etc
         
-        dummy_input = torch.randn(
+        # Export the embedding model
+        dummy_input = torch.zeros(
             1,
             self.context_length,
-            self.d_model
+            self.num_input_features,
+            dtype=torch.int32
         )
 
-        # Test it matches 
+        # Export model
+        torch.onnx.export(
+            self.embedding_model,
+            (dummy_input,),
+            output_dir / "embedding_model.onnx",
+            input_names=["tokens"],
+            output_names=["embeddings"],
+            opset_version=17,
+            do_constant_folding=True
+        )
+        
+        print(f"Exported ONNX embedding model")
+
+        # also export the model weights as binary so that we can ingest them in C and create our own implementation of the frontend of the model. 
+        for i, embedding in enumerate(self.embedding_model.embeddings):
+            embedding.weight.detach().cpu().numpy().astype("<f4").tofile(output_dir / f"embedding_{i}.bin")
+
+        self.embedding_model.pos_embedding.weight.detach().cpu().numpy().astype("<f4").tofile(output_dir / "pos_embedding.bin")
+
+        print(f"Exported embedding model raw weights")
+
+        # Next export the compute model
+        compute_model = EmbeddableComputeModel(self)
+        compute_model.eval()
+        compute_model_input = self.embedding_model(dummy_input)
+
+        # Test it matches pytorch compute model
         with torch.no_grad():
-            output_ebd = embeddable_model.forward(dummy_input)
-            output_cpu = self.process_compute_pytorch(dummy_input)
+            output_ebd = compute_model(compute_model_input)
+            output_cpu = self.process_compute_pytorch(compute_model_input)
 
             # Compare cpu model with last output of cpu model
             torch.testing.assert_close(
                 output_ebd,
-                output_cpu[:, -1, :]
+                output_cpu
             ) 
 
         # Export model
         torch.onnx.export(
-            embeddable_model,
-            dummy_input,
-            output_onnx,
+            compute_model,
+            (compute_model_input,),
+            output_dir / "compute_model.onnx",
             input_names=["embedded_input"],
             output_names=["logits"],
             opset_version=17,
             do_constant_folding=True
         )
 
-        print(f"Exported ONNX model to: {output_onnx}")
+        print(f"Exported ONNX compute model")
 
-        return embeddable_model
+        return
 
