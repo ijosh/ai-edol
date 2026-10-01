@@ -45,7 +45,7 @@ class InferenceRequest(ctypes.Structure):
         ("request_id", ctypes.c_uint64),
         ("input_type", ctypes.c_uint32),
         ("debug_flags", ctypes.c_uint32),
-        ("value", ctypes.c_uint8 * SAMPLE_SIZE_BYTES),
+        ("payload_len", ctypes.c_uint32),
     ]
 
 
@@ -71,15 +71,8 @@ def recv_exact(sock, size):
     return bytes(data)
 
 
-def send_request(sock, request_id, raw_values, input_type):
-    if len(raw_values) != SAMPLE_SIZE_BYTES:
-        raise ValueError(
-            f"Expected {SAMPLE_SIZE_BYTES} bytes, "
-            f"got {len(raw_values)}"
-        )
-
+def send_request(sock, request_id, payload, input_type):
     req = InferenceRequest()
-
     req.request_id = request_id
     req.input_type = input_type
 
@@ -92,14 +85,10 @@ def send_request(sock, request_id, raw_values, input_type):
         | HB_DEMO_DEBUG_DEQUANTIZED_OUTPUT
         | HB_DEMO_DEBUG_DECODED_TOKENS
     )
-
-    ctypes.memmove(
-        ctypes.addressof(req) + InferenceRequest.value.offset,
-        raw_values,
-        SAMPLE_SIZE_BYTES,
-    )
+    req.payload_len = len(payload)
 
     sock.sendall(bytes(req))
+    sock.sendall(payload)
 
 
 def receive_response(sock):
