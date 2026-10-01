@@ -7,6 +7,9 @@ def _write_f32(path: Path, values):
     values = np.asarray(values, dtype=np.float32)
     values.tofile(path)
 
+def _write_u8(path: Path, value):
+    value = np.asarray([value], dtype=np.uint8)
+    value.tofile(path)
 
 def export_tokenizer(
     output_dir,
@@ -57,6 +60,17 @@ def export_tokenizer(
     _write_f32(
         output_dir / "gas_bin_means.bin",
         gas_bin_means,
+    )
+
+    # --------------------------------------------
+    # Runtime configuration
+    # --------------------------------------------
+
+    use_log1p = 1 if value_transform == "log1p" else 0
+
+    _write_u8(
+        output_dir / "use_log1p.bin",
+        use_log1p,
     )
 
     # --------------------------------------------

@@ -44,8 +44,9 @@ from utils.json_logger import setup_json_logging
 from utils.device_utils import get_device_from_config
 from utils.generate_hailo_calibration_data import make_hailo_calibration_dataset
 from utils.export_tokenizer import export_tokenizer
+from utils.compile_onnx_to_hef import _compile_onnx_to_hef
 
-VALID_STAGES = ['dummy_data', 'tokeniser', 'sharding', 'training', 'inference', 'evaluation', 'generate_embedded_model']
+VALID_STAGES = ['dummy_data', 'tokeniser', 'sharding', 'training', 'inference', 'evaluation', 'generate_embedded_model', 'generate_hef', 'package_embedded_artifacts']
 
 
 def log(message, stage='PIPELINE'):
@@ -672,6 +673,238 @@ def stage_generate_embedded_model(config, run_path):
     return True
 
 
+def stage_generate_hef(config, run_path):
+
+    #podman run --rm -it \
+    #  --user 0:0 \
+    #  -v "$pwd:/workspace:z" \
+    #  -w /workspace \
+    #  -e home=/tmp/home \
+    #  -e pythonuserbase=/tmp/python-user \
+    #  -e mplconfigdir=/tmp/matplotlib \
+    #  hailo-eval \
+    #  /bin/bash -lc '
+    #    mkdir -p "$home" /tmp/python-user /tmp/matplotlib &&
+
+    #    python3 -m pip install \
+    #      --break-system-packages \
+    #      --user \
+    #      --no-deps \
+    #      seaborn &&
+
+    #    export pythonpath="/tmp/python-user/lib/python3.12/site-packages${pythonpath:+:$pythonpath}" &&
+
+    #    python3 run_pipeline.py \
+    #      --config config.yaml \
+    #      --stages generate_hef
+    #  '
+
+    """
+    Generate hailo hef from embedded model
+    """
+
+    stage_config = config.get('generate_hef', {}).copy()
+
+    embedded_model_dir = resolve(
+        run_path,
+        'embedded_models'
+    )
+
+    print(embedded_model_dir)
+    
+    hef_dest_dir = resolve(
+        run_path,
+        stage_config.get(
+            'output_dir',
+        )
+    )
+    
+    print(hef_dest_dir)
+    
+    os.makedirs(
+        hef_dest_dir,
+        exist_ok=True
+    )
+
+    electricity_onnx = os.path.join(
+        embedded_model_dir,
+        'electricity',
+        'compute_model.onnx'
+    )
+
+    gas_onnx = os.path.join(
+        embedded_model_dir,
+        'gas',
+        'compute_model.onnx'
+    )
+
+    electricity_calibration = os.path.join(
+        embedded_model_dir,
+        'electricity_calibration.npy'
+    )
+
+    gas_calibration = os.path.join(
+        embedded_model_dir,
+        'gas_calibration.npy'
+    )
+
+    # If create_embeddable_model() actually writes .onnx,
+    # adjust these paths accordingly:
+    #
+    # electricity_onnx += ".onnx"
+    # gas_onnx += ".onnx"
+
+    for path in [
+        electricity_onnx,
+        gas_onnx,
+        electricity_calibration,
+        gas_calibration,
+    ]:
+        if not os.path.exists(path):
+            log(
+                f"Required Hailo input not found: {path}",
+                'GENERATE_HEF'
+            )
+            return False
+
+    try:
+        # -----------------------------------------------------
+        # Electricity
+        # -----------------------------------------------------
+
+        log(
+            "Generating electricity HEF...",
+            'GENERATE_HEF'
+        )
+
+        electricity_hef = _compile_onnx_to_hef(
+            onnx_path=electricity_onnx,
+            calibration_path=electricity_calibration,
+            output_dir=hef_dest_dir,
+            model_name="electricity",
+            hw_arch=stage_config.get('hw_arch'),
+        )
+
+        log(
+            f"Electricity HEF: {electricity_hef}",
+            'GENERATE_HEF'
+        )
+
+        log(
+            "Generating gas HEF...",
+            'GENERATE_HEF'
+        )
+
+        gas_hef = _compile_onnx_to_hef(
+            onnx_path=gas_onnx,
+            calibration_path=gas_calibration,
+            output_dir=hef_dest_dir,
+            model_name="gas",
+            hw_arch=stage_config.get('hw_arch'),
+        )
+
+        log(
+            f"Gas HEF: {gas_hef}",
+            'GENERATE_HEF'
+        )
+
+    except Exception as exc:
+        log(
+            f"Hailo compilation failed: {exc}",
+            'GENERATE_HEF'
+        )
+        return False
+
+    log(
+        "HEF generation completed successfully",
+        'GENERATE_HEF'
+    )
+
+
+    return True
+
+def stage_package_embedded_artifacts(config, run_path):
+    """
+    Create separate deployment tarballs from config-defined file patterns.
+    """
+
+    import glob
+    import tarfile
+
+    stage_config = config.get('package_embedded_artifacts', {}).copy()
+
+    output_dir = resolve(
+        run_path,
+        stage_config.get('output_dir', 'packages')
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for model_name in ['electricity', 'gas']:
+        model_config = stage_config.get(model_name, {})
+
+        archive_name = model_config.get(
+            'archive_name',
+            f'{model_name}_deployment.tar.gz'
+        )
+
+        patterns = model_config.get('files', [])
+
+        if not patterns:
+            log(
+                f'No file patterns configured for {model_name}',
+                'PACKAGE_ARTIFACTS'
+            )
+            return False
+
+        matched_files = []
+
+        for pattern in patterns:
+            full_pattern = os.path.join(run_path, pattern)
+
+            for path in glob.glob(full_pattern, recursive=True):
+                if os.path.isfile(path):
+                    matched_files.append(os.path.abspath(path))
+
+        matched_files = sorted(set(matched_files))
+
+        if not matched_files:
+            log(
+                f'No files matched for {model_name}',
+                'PACKAGE_ARTIFACTS'
+            )
+            return False
+
+        archive_path = os.path.join(
+            output_dir,
+            archive_name
+        )
+
+        log(
+            f'Creating {archive_path} with {len(matched_files)} files',
+            'PACKAGE_ARTIFACTS'
+        )
+
+        with tarfile.open(archive_path, 'w:gz') as tar:
+            for path in matched_files:
+                arcname = os.path.relpath(path, run_path)
+
+                log(
+                    f'Adding {arcname}',
+                    'PACKAGE_ARTIFACTS'
+                )
+
+                tar.add(
+                    path,
+                    arcname=arcname
+                )
+
+        log(
+            f'Created package: {archive_path}',
+            'PACKAGE_ARTIFACTS'
+        )
+
+    return True
 
 
 STAGE_FUNCS = {
@@ -682,6 +915,8 @@ STAGE_FUNCS = {
     'inference': stage_inference,
     'evaluation': stage_evaluation,
     'generate_embedded_model': stage_generate_embedded_model,
+    'generate_hef': stage_generate_hef,
+    'package_embedded_artifacts': stage_package_embedded_artifacts,
 }
 
 

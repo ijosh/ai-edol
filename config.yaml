@@ -9,13 +9,16 @@ experiment:
   description: "End-to-end demo pipeline on generated dummy data"
   output_dir: "output"          # all stage outputs are written here
   stages:
-#    - dummy_data                # generate SERL-like dummy data
-#    - tokeniser                 # build tokenisers and tokenise data
-#    - sharding                  # create train/val/test shards
+    - dummy_data                # generate SERL-like dummy data
+    - tokeniser                 # build tokenisers and tokenise data
+    - sharding                  # create train/val/test shards
     - training                  # train electricity and gas GPT models
     - inference                 # generate synthetic data
     - evaluation                # evaluate fidelity of synthetic data
-    - generate_embedded_model   # Take the trained model and generate embedded model
+    - generate_embedded_model   # Take the trained model and generate embedded model (.onnx)
+ #   - generate_hef              # Use the onnx files to compile a hailo .hef file 
+    - package_embedded_artifacts 
+    
 
 # ---------------------------------------------------------------------------
 # DUMMY DATA
@@ -252,7 +255,7 @@ evaluation:
 
 
 # ---------------------------------------------------------------------------
-# EVALUATION
+# Embedded model
 # ---------------------------------------------------------------------------
 generate_embedded_model:
   path_to_trained_models: .
@@ -263,3 +266,27 @@ generate_embedded_model:
   # electricity_best_val_model.pth
   # gas_best_val_model.pth
   best_model_to_use: val
+
+
+generate_hef:
+  hw_arch: "hailo10h"
+  output_dir: hefs
+
+package_embedded_artifacts:
+  output_dir: packages
+
+  electricity:
+    archive_name: electricity_deployment.tar.gz
+    files:
+      - "embedded_models/tokenizer/*.bin"
+      - "embedded_models/electricity/embeddings_*.bin"
+      - "embedded_models/electricity/*.bin"
+      - "hefs/electricity.hef"
+
+  gas:
+    archive_name: gas_deployment.tar.gz
+    files:
+      - "embedded_models/tokenizer/*.bin"
+      - "embedded_models/gas/embeddings_*.bin"
+      - "embedded_models/gas/*.bin"
+      - "hefs/gas.hef"

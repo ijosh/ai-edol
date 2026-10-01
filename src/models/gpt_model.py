@@ -231,6 +231,9 @@ class GPTSmartMeterModel(nn.Module):
         """
         super(GPTSmartMeterModel, self).__init__()
 
+        # This dictionary will record outputs at various stages for debugging the embedded model
+        self.debug_cache = {}
+
         # Validate vocab_sizes length (simplified conditioning: 4 variables instead of 14)
         assert len(vocab_sizes) == 11, f"Expected 11 vocab_sizes, got {len(vocab_sizes)}"
         
@@ -317,23 +320,22 @@ class GPTSmartMeterModel(nn.Module):
 
         embeddings = self.embedding_model(x)
         output = self.process_compute(embeddings, backend=backend)
-
+        
         if log:
-            assert backend == "cpu", "Logging with backend != cpu"
-
-            # Log inputs as integer (token ids)
-            x.detach().cpu().numpy().astype("<i4").tofile("input.bin")
-
-            # Log embeddings and outputs as f32
-            embeddings.detach().cpu().numpy().astype("<f4").tofile("embeddings.bin")
-            output.detach().cpu().numpy().astype("<f4").tofile("output.bin")
-
+            self.debug_cache["tokens"] = x.detach().cpu().numpy().astype(np.int32).copy()
+            self.debug_cache["embeddings"] = embeddings.detach().cpu().numpy().astype(np.float32).copy()
+            self.debug_cache["output"] = output.detach().cpu().numpy().astype(np.float32).copy()
 
         return output
 
     def print_model_info(self):
         print(self)
     
+    def get_debug_cache(self):
+        return {
+            key: value.copy()
+            for key, value in self.debug_cache.items()
+        }
     
     def create_embeddable_model(self, output_dir):
         """
@@ -361,7 +363,8 @@ class GPTSmartMeterModel(nn.Module):
             input_names=["tokens"],
             output_names=["embeddings"],
             opset_version=17,
-            do_constant_folding=True
+            do_constant_folding=True,
+            dynamo=False
         )
         
         print(f"Exported ONNX embedding model")
@@ -398,7 +401,8 @@ class GPTSmartMeterModel(nn.Module):
             input_names=["embedded_input"],
             output_names=["logits"],
             opset_version=17,
-            do_constant_folding=True
+            do_constant_folding=True,
+            dynamo=False
         )
 
         print(f"Exported ONNX compute model")
