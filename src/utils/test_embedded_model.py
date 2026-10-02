@@ -455,22 +455,22 @@ def main():
             f"got {X_train.shape[1:]}"
         )
 
-    # --------------------------------------------------
-    # Load PyTorch model
-    # --------------------------------------------------
-
+    
+    # Load pytorch model for refernce
     model = torch.load(
         args.model_path,
         map_location="cpu",
         weights_only=False,
     )
 
+    # Put it in evaluation mode
     model.eval()
 
-    # --------------------------------------------------
-    # Process each training sample
-    # --------------------------------------------------
-
+    
+    # Sample training data and run it through the remote model and pytorch model
+    # The training data contains tokens only, so this is not a "raw input" like a sensor reading. 
+    # The remote inference runner supports raw inputs or tokens (controlled by req.input_type)
+    # If sending with input_type == raw, the model will try and tokenize the input
     for sample_index in range(len(X_train)):
         print(
             f"Processing sample "
@@ -483,22 +483,16 @@ def main():
         # Model expects [batch, sequence, features].
         tokens_tensor = tokens.unsqueeze(0)
 
-        print(
-            "Token shape:",
-            tokens_tensor.shape,
-        )
-
-        # --------------------------------------------------
-        # PyTorch reference
-        # --------------------------------------------------
-
+    
+        # Run pytorch model for reference
         with torch.no_grad():
             model(
                 tokens_tensor,
                 backend="cpu",
                 log=True,
             )
-
+        
+        # Debug cache contains tokens, embeddings etc for the last input
         reference = model.get_debug_cache()
 
         print(
@@ -506,10 +500,8 @@ def main():
             list(reference.keys()),
         )
 
-        # --------------------------------------------------
-        # Remote execution
-        # --------------------------------------------------
-
+        
+        # Format tokens to send to the remote model
         tokens_np = (
             tokens
             .detach()
@@ -519,7 +511,8 @@ def main():
         )
 
         token_values = tokens_np.tobytes()
-
+        
+        # Connect to the remote model and run the inference
         with socket.create_connection(
             (args.host, args.port)
         ) as sock:
